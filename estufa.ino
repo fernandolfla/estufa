@@ -24,6 +24,10 @@
 #include <DHT.h>
 #include <Preferences.h>
 #include <math.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
 
 // ─── Display HSPI ────────────────────────────────────────────
 #define TFT_MISO   12
@@ -84,6 +88,24 @@
 #define SENSOR_FAIL_MAX   5
 #define NVS_SAVE_INTERVAL 30000UL
 #define TEMP_WARN         45.0f   // aviso visual de temperatura
+
+// ─── WiFi ────────────────────────────────────────────────────
+#define WIFI_SSID         "Ahri"
+#define WIFI_PASS         "Fer988165786*"
+#define WIFI_TIMEOUT_MS   12000UL   // tempo máximo aguardando conexão no setup
+#define WIFI_RETRY_MS     60000UL   // intervalo de retentativa no loop
+
+// ─── NTP ─────────────────────────────────────────────────────
+#define NTP_SERVER        "pool.ntp.org"
+#define NTP_GMT_OFFSET    -10800    // UTC-3 (Brasília / Curitiba)
+#define NTP_DST_OFFSET    0
+
+// ─── Clima Open-Meteo (sem API key) ──────────────────────────
+#define WEATHER_URL       "https://api.open-meteo.com/v1/forecast" \
+                          "?latitude=-25.53&longitude=-49.20"       \
+                          "&current_weather=true"
+#define WEATHER_INTERVAL  (10UL * 60UL * 1000UL)   // a cada 10 min
+#define LOCATION_NAME     "Curitiba/PR"
 
 // ─── Layout ──────────────────────────────────────────────────
 #define HDR_H      22
@@ -152,6 +174,13 @@ unsigned long lastStatDisp   = 0;
 unsigned long lastFootDisp   = 0;
 unsigned long lastNVSSave    = 0;
 int           sensorFails    = 0;
+
+// ─── WiFi / NTP / Clima ──────────────────────────────────────
+bool          wifiConnected   = false;
+bool          ntpSynced       = false;
+float         extTemp         = NAN;      // temperatura externa (Open-Meteo)
+unsigned long lastWifiCheck   = 0;
+unsigned long lastWeatherFetch = 0;
 
 // ─── Cache de tela ───────────────────────────────────────────
 float     dspTemp     = -999.0f;
@@ -302,7 +331,18 @@ void readSensor() {
 //  NVS
 // ═══════════════════════════════════════════════════════════
 
-uint32_t currentDayIdx() { return (uint32_t)(millis() / 86400000UL); }
+uint32_t currentDayIdx() {
+  if (ntpSynced) {
+    struct tm t;
+    if (getLocalTime(&t)) {
+      // Retorna YYYYMMDD — chave de dia estável e real
+      return (uint32_t)((t.tm_year + 1900) * 10000 +
+                        (t.tm_mon  + 1)    * 100   +
+                         t.tm_mday);
+    }
+  }
+  return (uint32_t)(millis() / 86400000UL);  // fallback sem NTP
+}
 
 void loadNVS() {
   prefs.begin("estufa", true);
@@ -698,18 +738,32 @@ void updateFooter() {
   tft.fillRect(0, FOOT_Y, SCREEN_W, FOOT_H, 0x0841);
   tft.drawFastHLine(0, FOOT_Y, SCREEN_W, CLR_DARKGRAY);
 
-  unsigned long up = millis()/1000UL;
   char buf[48];
-  snprintf(buf,sizeof(buf),"%02lu:%02lu:%02lu",(up/3600)%24,(up/60)%60,up%60);
-  tft.setTextSize(1); tft.setTextColor(CLR_GRAY);
-  tft.setCursor(6, FOOT_Y+5); tft.print(buf);
 
+  // ── Hora ─────────────────────────────────────────────────
+  getTimeStr(buf);
+  tft.setTextSize(1);
+  tft.setTextColor(ntpSynced ? CLR_WHITE : CLR_GRAY);
+  tft.setCursor(6, FOOT_Y+5);
+  tft.print(buf);
+
+  // ── Local ────────────────────────────────────────────────
   tft.drawFastVLine(74, FOOT_Y+2, 13, CLR_DARKGRAY);
-  tft.setTextColor(CLR_DARKGRAY);
-  tft.setCursor(80, FOOT_Y+5); tft.print("Local: --");
+  tft.setTextColor(wifiConnected ? CLR_GRAY : CLR_DARKGRAY);
+  tft.setCursor(80, FOOT_Y+5);
+  tft.print(wifiConnected ? LOCATION_NAME : "WiFi: OFF");
 
-  tft.drawFastVLine(164, FOOT_Y+2, 13, CLR_DARKGRAY);
-  tft.setCursor(170, FOOT_Y+5); tft.print("Ext: --.-C");
+  // ── Temperatura externa ──────────────────────────────────
+  tft.drawFastVLine(178, FOOT_Y+2, 13, CLR_DARKGRAY);
+  tft.setCursor(184, FOOT_Y+5);
+  if (!isnan(extTemp)) {
+    snprintf(buf, sizeof(buf), "Ext:%.1fC", extTemp);
+    tft.setTextColor(CLR_CYAN);
+  } else {
+    snprintf(buf, sizeof(buf), "Ext: --.-C");
+    tft.setTextColor(CLR_DARKGRAY);
+  }
+  tft.print(buf);
 
   // Linha 2: uso acumulado
   tft.drawFastHLine(0, FOOT_Y+17, SCREEN_W, 0x1082);
@@ -831,6 +885,116 @@ void handleTouch() {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  WIFI / NTP / CLIMA
+// ═══════════════════════════════════════════════════════════
+
+// Mostra mensagem de status WiFi no rodapé durante o setup
+void showWifiStatus(const char* msg) {
+  tft.fillRect(0, FOOT_Y, SCREEN_W, FOOT_H, 0x0841);
+  tft.drawFastHLine(0, FOOT_Y, SCREEN_W, CLR_DARKGRAY);
+  tft.setTextSize(1);
+  tft.setTextColor(CLR_GRAY);
+  tft.setCursor(6, FOOT_Y + 11);
+  tft.print(msg);
+}
+
+// Conecta ao WiFi. Bloqueia até WIFI_TIMEOUT_MS ou conexão bem-sucedida.
+// Chamado uma vez no setup(); reconexões silenciosas são feitas no loop.
+void connectWiFi() {
+  showWifiStatus("Conectando WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT_MS) {
+    delay(300);
+  }
+
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  if (wifiConnected) {
+    // Sincroniza o relógio interno com o servidor NTP
+    configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, NTP_SERVER);
+    showWifiStatus("WiFi OK — sincronizando horario...");
+
+    // Aguarda até 5 s para o NTP responder
+    struct tm t;
+    unsigned long ntpStart = millis();
+    while (!getLocalTime(&t) && millis() - ntpStart < 5000) delay(200);
+    ntpSynced = getLocalTime(&t);
+  } else {
+    showWifiStatus("WiFi: falha — operando sem rede");
+    delay(1500);
+  }
+}
+
+// Verifica conexão e tenta reconectar se caiu (não bloqueante)
+void checkWiFi() {
+  if (millis() - lastWifiCheck < WIFI_RETRY_MS) return;
+  lastWifiCheck = millis();
+
+  bool connected = (WiFi.status() == WL_CONNECTED);
+  if (connected && !wifiConnected) {
+    // Reconectou — sincroniza NTP
+    configTime(NTP_GMT_OFFSET, NTP_DST_OFFSET, NTP_SERVER);
+  }
+  wifiConnected = connected;
+  if (wifiConnected) {
+    struct tm t;
+    if (!ntpSynced) ntpSynced = getLocalTime(&t);
+  }
+}
+
+// Faz GET na Open-Meteo e extrai temperature de current_weather.
+// Usa HTTPS sem validação de certificado (aceitável para IoT hobbyista).
+// Bloqueia por ~1-3 s — chamado no máximo a cada WEATHER_INTERVAL.
+void fetchWeather() {
+  if (!wifiConnected) return;
+  if (millis() - lastWeatherFetch < WEATHER_INTERVAL && lastWeatherFetch > 0) return;
+  lastWeatherFetch = millis();
+
+  WiFiClientSecure cli;
+  cli.setInsecure();   // sem validação de certificado
+  HTTPClient http;
+  http.begin(cli, WEATHER_URL);
+  http.setTimeout(8000);
+  int code = http.GET();
+
+  if (code == 200) {
+    String payload = http.getString();
+
+    // Localiza o objeto "current_weather": {...} e extrai "temperature"
+    int cwPos = payload.indexOf("\"current_weather\":{");
+    if (cwPos < 0) cwPos = payload.indexOf("\"current_weather\": {");
+    if (cwPos >= 0) {
+      int tPos = payload.indexOf("\"temperature\":", cwPos);
+      if (tPos >= 0) {
+        int valStart = tPos + 14;
+        while (valStart < payload.length() && payload[valStart] == ' ') valStart++;
+        char c = payload[valStart];
+        if (c == '-' || (c >= '0' && c <= '9')) {
+          float val = payload.substring(valStart).toFloat();
+          if (val > -60.0f && val < 70.0f) extTemp = val;
+        }
+      }
+    }
+  }
+  http.end();
+}
+
+// Preenche buf (tamanho >= 9) com horário local "HH:MM:SS"
+// ou com uptime se NTP não estiver sincronizado.
+void getTimeStr(char* buf) {
+  struct tm t;
+  if (ntpSynced && getLocalTime(&t)) {
+    snprintf(buf, 9, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  } else {
+    unsigned long up = millis() / 1000UL;
+    snprintf(buf, 9, "%02lu:%02lu:%02lu", (up/3600)%24, (up/60)%60, up%60);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════
 
@@ -860,8 +1024,13 @@ void setup() {
   // NVS (carrega dryTemp salvo e contadores de uso)
   loadNVS();
 
-  // Tela
+  // Tela inicial (antes do WiFi para resposta imediata)
   drawScreen();
+
+  // WiFi + NTP + primeira leitura de clima
+  connectWiFi();      // bloqueia até 12 s com feedback no footer
+  fetchWeather();     // busca temperatura externa imediatamente após conectar
+  drawScreen();       // redesenha com dados reais (hora, local, temp ext)
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -877,6 +1046,12 @@ void loop() {
   if (now - lastSensDisp >= 500)  { lastSensDisp = now; updateSensors(); }
   if (now - lastStatDisp >= 250)  { lastStatDisp = now; updateStatusBar(); }
   if (now - lastFootDisp >= 1000) { lastFootDisp = now; updateFooter(); }
+
+  // WiFi: verifica reconexão a cada 60 s (não bloqueante)
+  checkWiFi();
+
+  // Clima: busca Open-Meteo a cada 10 min (bloqueia ~1-3 s quando executa)
+  if (wifiConnected) fetchWeather();
 
   // Atualiza o valor de dryTemp no botão se mudou (ex.: após NVS load)
   if (activeMode == MODE_SECAGEM && dryTemp != dspDryTemp) {
