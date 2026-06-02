@@ -164,8 +164,9 @@ bool estufaTempSafety   = false;
 float dryTemp       = SECAR_TEMP_DEF;
 bool  dryTempSafety = false;   // true quando temp >= dryTemp, reset em <= dryTemp-3
 
-bool heaterOn = false;
-bool coolerOn = false;
+bool heaterOn        = false;
+bool coolerOn        = false;
+bool coolerTailActive = false;   // cooler sempre roda 5 min após o aquecedor desligar
 
 unsigned long coolerTailEnd  = 0;
 unsigned long lastSensorRead = 0;
@@ -186,10 +187,11 @@ unsigned long lastWeatherFetch = 0;
 float     dspTemp     = -999.0f;
 float     dspHum      = -999.0f;
 float     dspDryTemp  = -1.0f;
-bool      dspHeater   = false;
-bool      dspCooler   = false;
-CtrlState dspState    = ST_IDLE;
-OpMode    dspMode     = MODE_NONE;
+bool      dspHeater    = false;
+bool      dspCooler    = false;
+bool      dspTailActive = false;
+CtrlState dspState     = ST_IDLE;
+OpMode    dspMode      = MODE_NONE;
 
 // ─── Rastreamento de uso ─────────────────────────────────────
 unsigned long modeStartMs = 0;
@@ -206,24 +208,65 @@ bool          lastTouchDown = false;
 //  RELÉS
 // ═══════════════════════════════════════════════════════════
 
+// Quando o aquecedor DESLIGA: dispara automaticamente o tail de 5 min no cooler.
 void setHeater(bool on) {
   if (heaterOn == on) return;
+  bool wasOn = heaterOn;
   heaterOn = on;
   digitalWrite(HEATER_PIN, on ? RELAY_ON : RELAY_OFF);
+
+  if (wasOn && !on) {
+    // Aquecedor acabou de desligar — garante cooler por mais 5 min
+    coolerTailActive = true;
+    coolerTailEnd    = millis() + COOLER_TAIL_MS;
+    if (!coolerOn) {                            // garante que cooler está fisicamente ON
+      coolerOn = true;
+      digitalWrite(COOLER_PIN, RELAY_ON);
+    }
+  }
 }
 
+// O tail prevalece: nunca desliga o cooler enquanto o tail estiver ativo.
 void setCooler(bool on) {
-  if (coolerOn == on) return;
-  coolerOn = on;
-  digitalWrite(COOLER_PIN, on ? RELAY_ON : RELAY_OFF);
+  bool actual = (on || coolerTailActive);
+  if (coolerOn == actual) return;
+  coolerOn = actual;
+  digitalWrite(COOLER_PIN, actual ? RELAY_ON : RELAY_OFF);
 }
 
+// Verifica o vencimento do tail e desliga o cooler se tudo mais também estiver off.
+// "modeNeedsCooler": true enquanto o ciclo ativo ainda precisa do cooler (ex.: ST_DRYING
+// com temp.safety — não queremos desligar o cooler enquanto estamos apenas esperando o
+// aquecedor voltar).
+void updateCoolerTail() {
+  if (!coolerTailActive) return;
+  if (millis() < coolerTailEnd) return;
+
+  coolerTailActive = false;
+  bool modeNeedsCooler = (ctrlState == ST_DRYING || ctrlState == ST_COOLING);
+  if (!heaterOn && !modeNeedsCooler) {
+    coolerOn = false;
+    digitalWrite(COOLER_PIN, RELAY_OFF);
+  }
+}
+
+// Desativa o sistema. O cooler respeita o tail se o aquecedor estava ligado.
+// Para emergência (sensor falhou), use emergencyShutdown() que ignora o tail.
 void shutdownAll() {
   estufaHeaterWanted = false;
   estufaTempSafety   = false;
   dryTempSafety      = false;
-  setHeater(false);
-  setCooler(false);
+  setHeater(false);                  // dispara o tail se estava ligado
+  if (!coolerTailActive) {
+    setCooler(false);                // sem tail: desliga imediatamente
+  }
+}
+
+// Emergência: desliga TUDO imediatamente, cancela o tail.
+void emergencyShutdown() {
+  coolerTailActive = false;
+  heaterOn = false; digitalWrite(HEATER_PIN, RELAY_OFF);
+  coolerOn = false; digitalWrite(COOLER_PIN, RELAY_OFF);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -232,7 +275,7 @@ void shutdownAll() {
 
 void updateControl() {
   if (activeMode == MODE_NONE) { shutdownAll(); ctrlState = ST_IDLE; return; }
-  if (ctrlState == ST_EMERGENCY) { setHeater(false); setCooler(false); return; }
+  if (ctrlState == ST_EMERGENCY) { emergencyShutdown(); return; }
 
   // ──────────────────────────────────────────────────────────
   //  MODO ESTUFA — controle por umidade, cap de 50 °C
@@ -258,7 +301,7 @@ void updateControl() {
           estufaHeaterWanted = true;
           if (curHum <= HUM_RESET) {
             estufaHeaterWanted = false;
-            coolerTailEnd = millis() + COOLER_TAIL_MS;
+            // coolerTailEnd é definido automaticamente por setHeater(false) em applyRelays()
             ctrlState = ST_COOLING;
           }
           break;
@@ -317,7 +360,7 @@ void readSensor() {
     sensorFails++;
     if (sensorFails >= SENSOR_FAIL_MAX) {
       ctrlState = ST_EMERGENCY;
-      shutdownAll();
+      emergencyShutdown();   // desliga tudo imediatamente, sem tail
     }
     return;
   }
@@ -681,11 +724,20 @@ void drawFanIcon(int cx, int cy, bool on) {
 // ═══════════════════════════════════════════════════════════
 
 void updateStatusBar() {
-  bool changed = (heaterOn != dspHeater || coolerOn != dspCooler ||
-                  ctrlState != dspState || activeMode != dspMode);
+  bool changed = (heaterOn        != dspHeater     ||
+                  coolerOn        != dspCooler     ||
+                  coolerTailActive != dspTailActive ||
+                  ctrlState       != dspState      ||
+                  activeMode      != dspMode);
+  // Força redesenho enquanto tail está ativo (para atualizar o countdown)
+  if (coolerTailActive) changed = true;
   if (!changed) return;
-  dspHeater = heaterOn; dspCooler = coolerOn;
-  dspState  = ctrlState; dspMode  = activeMode;
+
+  dspHeater    = heaterOn;
+  dspCooler    = coolerOn;
+  dspTailActive = coolerTailActive;
+  dspState     = ctrlState;
+  dspMode      = activeMode;
 
   tft.fillRect(0, STAT_Y, SCREEN_W, STAT_H, CLR_BG);
   tft.drawFastHLine(0, STAT_Y, SCREEN_W, CLR_DARKGRAY);
@@ -702,13 +754,17 @@ void updateStatusBar() {
     tft.setTextColor(CLR_RED);
     tft.print("!! EMERGENCIA: sensor falhou !!");
   } else if (activeMode == MODE_SECAGEM) {
-    char buf[36];
+    char buf[40];
     if (heaterOn) {
       tft.setTextColor(CLR_ORANGE);
-      snprintf(buf,sizeof(buf),"Secagem %.0fC -> Aquecendo...", dryTemp);
+      snprintf(buf, sizeof(buf), "Secagem %.0fC -> Aquecendo...", dryTemp);
+    } else if (coolerTailActive) {
+      tft.setTextColor(CLR_CYAN);
+      unsigned long rem = (coolerTailEnd > millis()) ? (coolerTailEnd - millis())/1000UL : 0;
+      snprintf(buf, sizeof(buf), "Secagem %.0fC -> Resfriando %lus", dryTemp, rem);
     } else {
-      tft.setTextColor(CLR_GREEN);
-      snprintf(buf,sizeof(buf),"Secagem %.0fC -> OK (resfriando)", dryTemp);
+      tft.setTextColor(CLR_DARKGRAY);
+      snprintf(buf, sizeof(buf), "Secagem %.0fC -> Aguardando", dryTemp);
     }
     tft.print(buf);
   } else if (activeMode == MODE_ESTUFA) {
@@ -1042,6 +1098,7 @@ void loop() {
 
   readSensor();
   updateControl();
+  updateCoolerTail();   // gerencia o tail de 5 min do cooler após cada desligamento do aquecedor
 
   if (now - lastSensDisp >= 500)  { lastSensDisp = now; updateSensors(); }
   if (now - lastStatDisp >= 250)  { lastStatDisp = now; updateStatusBar(); }
