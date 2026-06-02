@@ -1,105 +1,132 @@
 # Skills & Padrões de Desenvolvimento — Estufa de Filamentos
 
-> Guia de referência para desenvolvimento como engenheiro sênior de firmware ESP32.
+> Guia de referência para desenvolvimento como engenheiro sênior de firmware ESP32-S3.
 > Consulte antes de implementar qualquer funcionalidade nova.
 
 ---
 
 ## Perfil de Desenvolvedor
 
-**Papel:** Engenheiro sênior de firmware embarcado para ESP32
+**Papel:** Engenheiro sênior de firmware embarcado para ESP32-S3
 **Postura:** Código correto antes de código bonito. Sem abstração prematura. Sem features não pedidas.
-**Regra de ouro de pinagem:** Nunca alterar GPIOs definidos sem avisar o desenvolvedor e aguardar confirmação explícita. Mesmo que a mudança pareça óbvia.
+**Regra de ouro de pinagem:** Nunca alterar GPIOs definidos sem avisar o desenvolvedor e aguardar confirmação explícita.
 
 ---
 
 ## Hardware Fixo — Não Alterar Sem Confirmação
 
-**Board:** ESP32 CYD 2432S028 ("Cheap Yellow Display")
-**Chip:** ESP32-WROOM-32 (Xtensa LX6 dual-core, 240 MHz, 520 KB SRAM, 4 MB Flash)
+**Board:** LCDWIKI ES3C28P / ES3N28P
+**Chip:** ESP32-S3 (Xtensa LX7 dual-core, 240 MHz, 512 KB SRAM, 8 MB Flash)
+**IDE settings:** Board=`ESP32S3 Dev Module` | Partition=`Huge APP (3MB No OTA)` | USB=`Hardware CDC and JTAG`
 
 ### GPIOs em uso — TRAVADOS
 
 | Função | GPIO | Direção | Observação |
 |--------|------|---------|-----------|
-| TFT_MISO | 12 | INPUT | HSPI — não reatribuir |
-| TFT_MOSI | 13 | OUTPUT | HSPI — não reatribuir |
-| TFT_CLK | 14 | OUTPUT | HSPI — não reatribuir |
-| TFT_CS | 15 | OUTPUT | HSPI — não reatribuir |
-| TFT_DC | 2 | OUTPUT | HSPI — também é LED onboard |
-| TFT_RST | -1 | — | Hardware pull para 3.3V, sem GPIO |
-| TFT_BL | 21 | OUTPUT | Backlight (HIGH = ligado) |
-| TOUCH_MOSI | 32 | OUTPUT | VSPI — não reatribuir |
-| TOUCH_MISO | 39 | INPUT ONLY | VSPI — sem pull-up programável |
-| TOUCH_CLK | 25 | OUTPUT | VSPI — não reatribuir |
-| TOUCH_CS | 33 | OUTPUT | VSPI — não reatribuir |
-| TOUCH_IRQ | 36 | INPUT ONLY | IRQ ativo LOW — sem pull-up programável |
+| TFT_SCK | 12 | OUTPUT | SPI clock display |
+| TFT_MOSI | 11 | OUTPUT | SPI dados display |
+| TFT_MISO | 13 | INPUT | SPI leitura |
+| TFT_CS | 10 | OUTPUT | Chip select display |
+| TFT_DC | 46 | OUTPUT | Data/Command |
+| TFT_RST | -1 | — | Sem GPIO |
+| TFT_BL | 45 | OUTPUT | Backlight — `analogWrite(TFT_BL, 255)` |
+| TOUCH_SDA | 16 | I/O | I2C dados FT6336G |
+| TOUCH_SCL | 15 | OUTPUT | I2C clock FT6336G |
+| TOUCH_INT | 17 | INPUT | Interrupt (INPUT_PULLUP) |
+| TOUCH_RST | 18 | OUTPUT | Reset hardware do touch |
+| DHT22_PIN | 2 | I/O | Sensor temperatura/umidade |
+| HEATER_PIN | 3 | OUTPUT | Relé aquecedor (ativo LOW) |
+| COOLER_PIN | 14 | OUTPUT | Relé cooler/fan (ativo LOW) |
+| Spare | 21 | — | Disponível no conector P3/CN1 |
 
-### GPIOs input-only (34, 35, 36, 39) — nunca usar como OUTPUT
-> Qualquer tentativa de `pinMode(36, OUTPUT)` ou `pinMode(39, OUTPUT)` é silenciosa mas não funciona — pode causar comportamento indefinido.
+### Nota importante: Sem GPIOs input-only no ESP32-S3
 
-### GPIOs disponíveis para expansão (não ocupados pelo hardware base)
+No ESP32-S3 **todos os GPIOs são bidirecionais**. A restrição de GPIOs 34/35/36/39 como input-only existia apenas no ESP32 original (WROOM-32). No S3 não há essa limitação.
+
+Strapping pins que merecem atenção: GPIO 0 (boot mode), GPIO 45 e 46 (já em uso para BL e DC).
+
+### GPIOs livres para expansão futura
 
 | GPIO | Observação |
 |------|-----------|
 | 4 | Livre |
-| 5 | Livre (boot mode — cuidado em reset) |
-| 16 | Livre |
-| 17 | Livre |
-| 18 | Livre |
-| 19 | Livre |
-| 22 | Livre (I2C SDA padrão) |
-| 23 | Livre (I2C SCL padrão) |
-| 26 | Livre |
-| 27 | Livre |
-| 34 | Input only — bom para sensores analógicos |
-| 35 | Input only — bom para sensores analógicos |
-
-> **Antes de alocar qualquer GPIO novo para sensor, aquecedor ou ventilador — informar ao desenvolvedor e aguardar aprovação.**
+| 5 | Livre (strapping — cuidado em reset) |
+| 6–9 | Livre |
+| 21 | Livre — conector físico disponível |
+| 38–42 | Livres |
+| 47–48 | Livres |
 
 ---
 
 ## Skill 01 — Inicialização Correta do Hardware
 
-**Contexto:** Todo firmware novo deve inicializar display e touch exatamente nesta ordem e com estes parâmetros.
+**Contexto:** Todo firmware deve inicializar display e touch exatamente nesta ordem.
 
 **Ordem obrigatória:**
 1. `Serial.begin(115200)`
-2. `pinMode(TFT_BL, OUTPUT)` + `digitalWrite(TFT_BL, HIGH)`
-3. `hspi.begin(TFT_CLK, TFT_MISO, TFT_MOSI, TFT_CS)`
-4. `tft.init(240, 320)` ← parâmetros são dimensões físicas do painel, não da tela rotacionada
-5. `tft.invertDisplay(true)` ← **obrigatório** neste modelo
-6. `tft.setRotation(3)` ← landscape 320×240
-7. `tft.fillScreen(0x0000)`
-8. `vspi.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS)`
-9. `pinMode(TOUCH_CS, OUTPUT)` + `digitalWrite(TOUCH_CS, HIGH)`
-10. `pinMode(TOUCH_IRQ, INPUT)`
+2. Relés OFF antes de qualquer outra coisa: `pinMode(HEATER_PIN, OUTPUT); digitalWrite(HEATER_PIN, RELAY_OFF);`
+3. `pinMode(TFT_BL, OUTPUT); analogWrite(TFT_BL, 255)` ← usar `analogWrite`, não `digitalWrite`
+4. `tftSPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS)`
+5. `tft.begin(40000000)` ← 40 MHz
+6. `tft.setRotation(1)` ← landscape 320×240
+7. `tft.fillScreen(CLR_BG)`
+8. `Wire.begin(TOUCH_SDA, TOUCH_SCL)`
+9. Reset hardware do touch: `digitalWrite(TOUCH_RST, LOW); delay(10); digitalWrite(TOUCH_RST, HIGH); delay(100);`
+10. `pinMode(TOUCH_INT, INPUT_PULLUP)`
+11. `ts.begin(40)` ← threshold FT6206
 
-**Por que `invertDisplay(true)`?** O painel físico deste modelo tem polaridade de cor invertida no hardware. Omitir faz preto virar branco, vermelho virar ciano, etc.
+**Declaração dos objetos:**
+```cpp
+SPIClass         tftSPI(HSPI);
+Adafruit_ILI9341 tft(&tftSPI, TFT_DC, TFT_CS, TFT_RST);
+Adafruit_FT6206  ts;
+```
 
-**Por que `init(240, 320)` e não `(320, 240)`?** A biblioteca recebe dimensões nativas do painel (portrait físico). A rotação 3 é aplicada depois.
+**Por que `analogWrite` no backlight?** O pino BL do ILI9341 nesta placa suporta controle de brilho por PWM. `digitalWrite(HIGH)` também funciona mas limita ao brilho máximo.
+
+**Por que `tft.begin(40000000)` e não `tft.init()`?** O ILI9341 usa `begin(freq)` ao invés de `init(w, h)` da ST7789. Não é necessário `invertDisplay()` neste modelo.
 
 ---
 
-## Skill 02 — Leitura de Touch Robusta
+## Skill 02 — Leitura de Touch (FT6336G I2C Capacitivo)
 
-**Contexto:** O XPT2046/TPM408 é ruidoso. Leitura única é instável. Usar sempre o padrão com 8 amostras + filtro de outlier.
+**Contexto:** O FT6336G é capacitivo, retorna coordenadas diretamente via I2C. Diferente do XPT2046 (SPI resistivo), não precisa de múltiplas amostras nem filtro manual.
+
+**Mapeamento de coordenadas para `setRotation(1)` landscape:**
+O chip reporta em portrait nativo (x: 0–240, y: 0–320). Para landscape:
+- `tx = map(p.y, 0, 320, 0, SCREEN_W)`
+- `ty = map(p.x, 0, 240, SCREEN_H, 0)`
 
 **Padrão aprovado:**
-- 8 amostras por leitura
-- Insertion sort + descarte dos 2 menores e 2 maiores
-- Média dos 4 valores centrais
-- Verificação de IRQ antes E depois da leitura (detecta dedo levantado durante amostragem)
-- Rejeição de valores fora da faixa 200–3900 (ruído elétrico)
-- Mapeamento calibrado: raw 300–3750 → pixels 0–319 / 0–239
-- `setRotation(3)`: ambos os eixos mapeados normalmente (sem inversão)
-- SPISettings: 1 MHz, MSBFIRST, SPI_MODE0
-- Comando `0x90` = canal Y do chip = eixo X na tela (landscape)
-- Comando `0xD0` = canal X do chip = eixo Y na tela (landscape)
+```cpp
+bool readTouch(int16_t &tx, int16_t &ty) {
+  if (!ts.touched()) return false;
+  TS_Point p = ts.getPoint();
+  if (p.x == 0 && p.y == 0) return false;
+  tx = constrain(map(p.y, 0, 320, 0, SCREEN_W), 0, SCREEN_W - 1);
+  ty = constrain(map(p.x, 0, 240, SCREEN_H, 0), 0, SCREEN_H - 1);
+  return true;
+}
+```
 
-**Debounce:** mínimo 300 ms entre taps reconhecidos (`detectTap()`).
+**Debounce de tap:**
+```cpp
+bool detectTap(int16_t &tx, int16_t &ty) {
+  bool pressed = readTouch(tx, ty);
+  unsigned long now = millis();
+  if (pressed && !lastTouchDown && (now - lastTouchTime > 300)) {
+    lastTouchDown = true; lastTouchTime = now; return true;
+  }
+  if (!pressed) lastTouchDown = false;
+  return false;
+}
+```
 
-**Nunca usar a função de touch da Adafruit_GFX ou bibliotecas genéricas** — o barramento VSPI é dedicado e a calibração é específica deste modelo.
+**Bibliotecas necessárias:**
+```cpp
+#include <Wire.h>
+#include <Adafruit_FT6206.h>
+```
 
 ---
 
@@ -107,7 +134,6 @@
 
 **Contexto:** Toda navegação de telas usa state machine com enum + funções `drawXXX()` / `loopXXX()`.
 
-**Padrão:**
 ```cpp
 enum AppState { STATE_A, STATE_B, ... };
 AppState currentState = STATE_A;
@@ -125,42 +151,60 @@ void loop() {
 
 **Regras:**
 - `drawXXX()` é chamada UMA vez na transição de estado (limpa a tela e renderiza)
-- `loopXXX()` é chamada continuamente no `loop()` — só lida com input e atualizações dinâmicas
-- Transição de estado: `currentState = STATE_X; drawX();`
+- `loopXXX()` é chamada continuamente — só lida com input e atualizações dinâmicas
 - Nunca chamar `tft.fillScreen()` dentro de `loopXXX()` (causa flickering)
 
 ---
 
 ## Skill 04 — Rendering sem Flickering
 
-**Contexto:** Atualizar valores numéricos na tela sem redesenhar o fundo completo.
-
-**Técnica — apagar só a área do valor:**
+**Técnica base — apagar só a área do valor:**
 ```cpp
-// Apaga o retângulo do valor anterior
 tft.fillRect(x, y, largura, altura, CLR_BG);
-// Desenha o novo valor
 tft.setCursor(x, y);
 tft.print(novoValor);
 ```
 
-**Para valores numéricos frequentes (temperatura, timer):**
-- Definir posição e tamanho fixos no layout
-- Usar `tft.fillRect()` somente na área do número, nunca em toda a tela
-- Manter `lastValue` para só redesenhar quando o valor mudar
+**Técnica avançada — texto com fundo (sem fillRect):**
+```cpp
+tft.setTextColor(CLR_WHITE, CLR_BG);   // 2º parâmetro = cor de fundo
+tft.setCursor(x, y);
+tft.print(valor);   // sobrescreve pixels de fundo junto com o texto
+```
+Usar quando o texto sempre tem o mesmo número de caracteres (ex: relógio HH:MM:SS). Elimina o flash preto entre apagar e redesenhar.
 
-**Nunca usar** `tft.fillScreen()` no loop de atualização de sensores.
+**Técnica de cache de estado — só redesenha quando muda:**
+```cpp
+// Variáveis de cache globais (ex: footer)
+char  ftrTime[9] = "";
+bool  footerDirty = true;   // setado em drawScreen() para forçar redesenho completo
+
+void updateFooter() {
+  char timeStr[9]; getTimeStr(timeStr);
+  bool timeChanged = (strcmp(timeStr, ftrTime) != 0);
+  bool fullRedraw  = footerDirty || wifiChanged || extChanged || usageChanged;
+  if (!timeChanged && !fullRedraw) return;
+  if (fullRedraw) { /* fillRect + redesenha tudo */ footerDirty = false; }
+  // Relógio: sobrescreve no lugar (sem fillRect)
+  tft.setTextColor(CLR_WHITE, 0x0841);
+  tft.setCursor(6, FOOT_Y+5); tft.print(timeStr);
+}
+```
+
+**Intervalos de atualização aprovados no loop:**
+```cpp
+if (now - lastSensDisp >= 500)  updateSensors();    // 2 Hz
+if (now - lastStatDisp >= 1000) updateStatusBar();  // 1 Hz (era 250ms — causava flicker)
+if (now - lastFootDisp >= 1000) updateFooter();     // 1 Hz com cache interno
+```
 
 ---
 
 ## Skill 05 — Controle de Tempo sem `delay()`
 
-**Contexto:** `delay()` bloqueia o loop e congela o touch. Usar sempre comparação de `millis()`.
-
-**Padrão:**
 ```cpp
 unsigned long lastUpdate = 0;
-const unsigned long INTERVAL = 1000; // ms
+const unsigned long INTERVAL = 1000;
 
 void loop() {
   unsigned long now = millis();
@@ -168,19 +212,15 @@ void loop() {
     lastUpdate = now;
     // executa tarefa periódica
   }
-  // touch e UI continuam responsivos
 }
 ```
 
-**Regra:** `delay()` só é aceitável na inicialização (antes do loop principal) ou em animações deliberadas de splash screen.
+`delay()` só é aceitável na inicialização (antes do loop) ou em animações de splash screen.
 
 ---
 
 ## Skill 06 — Paleta de Cores RGB565
 
-**Contexto:** Todas as cores devem usar constantes nomeadas com prefixo `CLR_`. Nunca usar valores hexadecimais soltos no código.
-
-**Paleta base aprovada:**
 ```cpp
 #define CLR_BG       0x0000   // preto
 #define CLR_WHITE    0xFFFF   // branco
@@ -195,143 +235,127 @@ void loop() {
 #define CLR_DARKGRAY 0x2104
 ```
 
-**Conversão dinâmica:** `tft.color565(R, G, B)` onde R, G, B ∈ [0, 255]
+Nunca usar valores hex soltos no código — sempre usar constante `CLR_`.
+Conversão dinâmica: `tft.color565(R, G, B)` onde R, G, B ∈ [0, 255].
 
 ---
 
-## Skill 10 — Controle por Histerese Dupla (umidade + temperatura)
+## Skill 07 — Leitura de Sensores
 
-**Contexto:** Quando um sistema precisa de dois limites distintos para ligar e desligar (evitar oscilação rápida), e um segundo critério de segurança que sobrepõe o primeiro.
-
-**Padrão implementado na estufa:**
-```
-Umidade:
-  IDLE     → DRYING   : hum >= HUM_TRIGGER (40%)
-  DRYING   → COOLING  : hum <= HUM_RESET   (32%)   ← histerese de 8%
-  COOLING  → IDLE     : após COOLER_TAIL_MS (5 min)
-  Não reinicia em IDLE até hum >= 40% novamente
-
-Temperatura (sobrepõe umidade):
-  tempSafety = true  : temp >= TEMP_CUTOFF (50°C)  — heater OFF forçado
-  tempSafety = false : temp <= TEMP_RESUME (47°C)  — heater pode voltar
-  3°C de histerese previne ciclos rápidos em 47-50°C
-```
-
-**Regra:** `heaterActual = heaterWanted && !tempSafety && (ctrlState == ST_DRYING)`
-
-**Por que dois valores separados e não um único threshold:**
-Se usasse apenas 36% para ligar e desligar, uma pequena oscilação de 35-37% faria o relay ciclar dezenas de vezes por hora, desgastando o hardware e causando ruído elétrico.
-
----
-
-## Skill 11 — Proteção Anti-Falha de Sensor
-
-**Contexto:** Se o DHT22 falha (retorna NaN), não sabemos a temperatura real. Não podemos manter o aquecedor ligado.
-
-**Padrão:**
-```cpp
-if (isnan(t) || isnan(h)) {
-  sensorFails++;
-  if (sensorFails >= SENSOR_FAIL_MAX) {
-    ctrlState = ST_EMERGENCY;
-    emergencyShutdown();   // desliga TUDO
-  }
-  return;   // não atualiza curTemp/curHum
-}
-sensorFails = 0;   // reset no sucesso
-```
-
-**Regra para temperatura NaN:** mantém `tempSafety` no valor atual (não reseta para false). Conservador por omissão — se não sabe, não deixa o heater voltar.
-
-**Emergência:** uma vez em `ST_EMERGENCY`, só power cycle reseta. Mostra aviso vermelho na tela.
-
----
-
-## Skill 07 — Leitura de Sensores I2C
-
-**Contexto:** Sensores de temperatura/umidade como SHT31 ou HTU21D usam I2C. Os pinos padrão do ESP32 para I2C são SDA=22, SCL=23 — mas precisam de confirmação antes de usar.
-
-**Padrão para SHT31 (mais preciso, recomendado):**
-```cpp
-#include <Wire.h>
-#include <Adafruit_SHT31.h>
-
-Adafruit_SHT31 sht31;
-
-// No setup():
-Wire.begin(SDA_PIN, SCL_PIN);
-sht31.begin(0x44);   // endereço padrão
-
-// No loop() (com millis, nunca blocking):
-float temp = sht31.readTemperature();
-float hum  = sht31.readHumidity();
-if (!isnan(temp) && !isnan(hum)) {
-  // atualiza display
-}
-```
-
-**Padrão para DHT22 (mais simples, um pino):**
+**DHT22 (um pino, temperatura + umidade):**
 ```cpp
 #include <DHT.h>
-DHT dht(SENSOR_PIN, DHT22);
+DHT dht(DHT22_PIN, DHT22);   // DHT22_PIN = GPIO 2
 dht.begin();
 float temp = dht.readTemperature();
 float hum  = dht.readHumidity();
+if (isnan(temp) || isnan(hum)) { /* tratar falha */ }
 ```
 
-> **ATENÇÃO:** Pinos SDA/SCL não estão definidos ainda. Informar ao desenvolvedor antes de alocar.
+**SHT31 via I2C (mais preciso, alternativa futura):**
+```cpp
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
+Adafruit_SHT31 sht31;
+Wire.begin(TOUCH_SDA, TOUCH_SCL);   // mesmos pinos do touch (barramento compartilhado)
+sht31.begin(0x44);
+float temp = sht31.readTemperature();
+float hum  = sht31.readHumidity();
+```
 
 ---
 
-## Skill 08 — Controle de Aquecedor (Bang-Bang)
+## Skill 08 — Controle de Relé (Bang-Bang com Histerese)
 
-**Contexto:** Controle on/off simples para aquecedor por relay ou MOSFET. Adequado para estufas com inércia térmica alta.
-
-**Padrão com histerese:**
 ```cpp
-const float HYSTERESIS = 1.5; // °C acima/abaixo do alvo
+#define RELAY_ON   LOW    // relés ativo LOW
+#define RELAY_OFF  HIGH
 
-void updateHeater(float currentTemp, float targetTemp) {
-  if (currentTemp < targetTemp - HYSTERESIS) {
-    digitalWrite(HEATER_PIN, HIGH);  // liga
-    heaterOn = true;
-  } else if (currentTemp > targetTemp + HYSTERESIS) {
-    digitalWrite(HEATER_PIN, LOW);   // desliga
-    heaterOn = false;
-  }
-  // entre os limiares: mantém estado atual (histerese)
+void setHeater(bool on) {
+  if (heaterOn == on) return;   // evita acionamento desnecessário
+  heaterOn = on;
+  digitalWrite(HEATER_PIN, on ? RELAY_ON : RELAY_OFF);
 }
 ```
 
-**Histerese obrigatória** — sem ela o relay liga/desliga centenas de vezes por minuto (degrada o relay e causa ruído elétrico).
+**Histerese obrigatória** — sem ela o relay cicla centenas de vezes por hora.
 
-> **ATENÇÃO:** Pino do aquecedor (`HEATER_PIN`) não está definido. Informar ao desenvolvedor qual GPIO usar antes de implementar.
+**Sequência de inicialização segura (no setup(), antes de tudo):**
+```cpp
+pinMode(HEATER_PIN, OUTPUT); digitalWrite(HEATER_PIN, RELAY_OFF);
+pinMode(COOLER_PIN, OUTPUT); digitalWrite(COOLER_PIN, RELAY_OFF);
+```
 
 ---
 
 ## Skill 09 — Persistência de Configurações (NVS / Preferences)
 
-**Contexto:** Salvar temperatura alvo, perfil selecionado e configurações que devem sobreviver ao reset.
-
-**Padrão com biblioteca Preferences (ESP32 nativa):**
 ```cpp
 #include <Preferences.h>
 Preferences prefs;
 
 // Salvar:
-prefs.begin("estufa", false);     // namespace "estufa", modo leitura/escrita
-prefs.putFloat("targetTemp", targetTemp);
-prefs.putInt("profileIdx", profileIdx);
+prefs.begin("estufa", false);
+prefs.putFloat("dryTemp", dryTemp);
+prefs.putUInt("totalMin", nvsTotalMin);
 prefs.end();
 
 // Carregar no setup():
-prefs.begin("estufa", true);      // modo somente leitura
-targetTemp = prefs.getFloat("targetTemp", 65.0);   // 65.0 = default
-profileIdx = prefs.getInt("profileIdx", 0);
+prefs.begin("estufa", true);
+dryTemp     = prefs.getFloat("dryTemp", 45.0f);
+nvsTotalMin = prefs.getUInt("totalMin", 0);
 prefs.end();
 ```
 
-**Não usar EEPROM.h** — Preferences usa NVS (Non-Volatile Storage) nativa do ESP32, mais robusta e sem risco de wear em escrita frequente.
+Não usar `EEPROM.h` — Preferences usa NVS nativa do ESP32/S3, mais robusta.
+
+---
+
+## Skill 10 — Controle por Histerese Dupla (umidade + temperatura)
+
+```
+Umidade (MODO ESTUFA):
+  IDLE   → DRYING  : hum >= 40%
+  DRYING → COOLING : hum <= 32%   ← histerese de 8%
+  COOLING → IDLE   : após 5 min (COOLER_TAIL_MS)
+
+Temperatura (segurança — sobrepõe umidade):
+  tempSafety = true  : temp >= 50°C → heater OFF forçado
+  tempSafety = false : temp <= 47°C → heater pode voltar
+```
+
+`heaterActual = heaterWanted && !tempSafety && (ctrlState == ST_DRYING)`
+
+---
+
+## Skill 11 — Proteção Anti-Falha de Sensor
+
+```cpp
+if (isnan(t) || isnan(h)) {
+  sensorFails++;
+  if (sensorFails >= SENSOR_FAIL_MAX) {   // 5 falhas consecutivas
+    ctrlState = ST_EMERGENCY;
+    emergencyShutdown();   // desliga TUDO imediatamente, sem cooler tail
+  }
+  return;
+}
+sensorFails = 0;
+```
+
+Temperatura NaN: mantém `tempSafety` no valor atual (conservador).
+Emergência: só reset por power cycle. Mostra aviso vermelho na tela.
+
+---
+
+## Referência — ILI9341 vs ST7789 (diferenças relevantes)
+
+| Aspecto | ST7789 (CYD antigo) | ILI9341 (S3 atual) |
+|---------|--------------------|--------------------|
+| Init | `tft.init(240, 320)` | `tft.begin(40000000)` |
+| invertDisplay | `true` (obrigatório) | Não necessário |
+| setRotation landscape | `3` | `1` |
+| Biblioteca | `Adafruit_ST7789` | `Adafruit_ILI9341` |
+| Backlight | `digitalWrite(HIGH)` | `analogWrite(255)` |
 
 ---
 
@@ -343,5 +367,5 @@ prefs.end();
 4. **Sem features não pedidas** — implementar exatamente o que foi solicitado
 5. **Sem abstração prematura** — 3 linhas repetidas são melhores que uma função desnecessária
 6. **Sem comentários que descrevem o que o código faz** — apenas comentários que explicam o *porquê*
-7. **Testar no hardware real** — lógica que funciona no simulador pode falhar no ESP32 (timing, IRQ, SPI)
-8. **GPIOs input-only (34, 35, 36, 39)** — nunca declarar como OUTPUT
+7. **Relés sempre OFF na primeira linha do setup()** — segurança antes de qualquer outra inicialização
+8. **No ESP32-S3 não há GPIOs input-only** — todos os pinos são bidirecionais

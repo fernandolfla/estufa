@@ -19,8 +19,10 @@
  */
 
 #include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
+#include <Adafruit_ILI9341.h>
+#include <Adafruit_FT6206.h>
 #include <DHT.h>
 #include <Preferences.h>
 #include <math.h>
@@ -29,26 +31,25 @@
 #include <HTTPClient.h>
 #include <time.h>
 
-// ─── Display HSPI ────────────────────────────────────────────
-#define TFT_MISO   12
-#define TFT_MOSI   13
-#define TFT_CLK    14
-#define TFT_CS     15
-#define TFT_DC      2
-#define TFT_RST    -1
-#define TFT_BL     21
+// ─── Display SPI ─────────────────────────────────────────────
+#define TFT_SCK   12
+#define TFT_MOSI  11
+#define TFT_MISO  13
+#define TFT_CS    10
+#define TFT_DC    46
+#define TFT_RST   -1
+#define TFT_BL    45
 
-// ─── Touch VSPI ──────────────────────────────────────────────
-#define TOUCH_MOSI 32
-#define TOUCH_MISO 39
-#define TOUCH_CLK  25
-#define TOUCH_CS   33
-#define TOUCH_IRQ  36
+// ─── Touch I2C ───────────────────────────────────────────────
+#define TOUCH_SDA  16
+#define TOUCH_SCL  15
+#define TOUCH_INT  17
+#define TOUCH_RST  18
 
 // ─── Periféricos ─────────────────────────────────────────────
-#define DHT22_PIN   4
-#define HEATER_PIN 26
-#define COOLER_PIN 27
+#define DHT22_PIN   2
+#define HEATER_PIN  3
+#define COOLER_PIN 14
 #define RELAY_ON   LOW
 #define RELAY_OFF  HIGH
 
@@ -110,7 +111,7 @@
 // ─── Layout ──────────────────────────────────────────────────
 #define HDR_H      22
 #define BTN_Y      24
-#define BTN_H      92
+#define BTN_H     104
 #define BTN_W     148
 #define BTN_L       6
 #define BTN_R     166
@@ -131,19 +132,19 @@
 #define PLUS_TY1   (BTN_Y + 62)
 #define PLUS_TY2   (BTN_Y + BTN_H - 3)
 
-#define SENS_Y    118
-#define SENS_H     68
+#define SENS_Y    130
+#define SENS_H     58
 #define STAT_Y    188
 #define STAT_H     20
 #define FOOT_Y    210
 #define FOOT_H     30
 
 // ─── Objetos ─────────────────────────────────────────────────
-SPIClass        hspi(HSPI);
-SPIClass        vspi(VSPI);
-Adafruit_ST7789 tft = Adafruit_ST7789(&hspi, TFT_CS, TFT_DC, TFT_RST);
-DHT             dht(DHT22_PIN, DHT22);
-Preferences     prefs;
+SPIClass         tftSPI(HSPI);
+Adafruit_ILI9341 tft(&tftSPI, TFT_DC, TFT_CS, TFT_RST);
+Adafruit_FT6206  ts;
+DHT              dht(DHT22_PIN, DHT22);
+Preferences      prefs;
 
 // ─── Enums ───────────────────────────────────────────────────
 enum CtrlState { ST_IDLE, ST_DRYING, ST_COOLING, ST_EMERGENCY };
@@ -192,6 +193,14 @@ bool      dspCooler    = false;
 bool      dspTailActive = false;
 CtrlState dspState     = ST_IDLE;
 OpMode    dspMode      = MODE_NONE;
+
+// ─── Cache do rodapé ─────────────────────────────────────────
+char     ftrTime[9]  = "";
+float    ftrExtTemp  = -9999.0f;
+bool     ftrWifi     = false;
+uint32_t ftrToday    = 0xFFFFFFFF;
+uint32_t ftrTotal    = 0xFFFFFFFF;
+bool     footerDirty = true;
 
 // ─── Rastreamento de uso ─────────────────────────────────────
 unsigned long modeStartMs = 0;
@@ -428,32 +437,16 @@ void saveNVS(bool force = false) {
 //  TOUCH
 // ═══════════════════════════════════════════════════════════
 
-uint16_t touchReadRaw(uint8_t cmd) {
-  vspi.transfer(cmd);
-  uint16_t v = (vspi.transfer(0) << 8) | vspi.transfer(0);
-  return v >> 3;
-}
-
+// Touch I2C capacitivo FT6336G
+// Chip reporta em portrait (x=0..240, y=0..320).
+// setRotation(1) landscape: tx = map(p.y, 0..320, 0..SCREEN_W)
+//                           ty = map(p.x, 0..240, SCREEN_H..0)
 bool readTouch(int16_t &tx, int16_t &ty) {
-  if (digitalRead(TOUCH_IRQ) == HIGH) return false;
-  vspi.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(TOUCH_CS, LOW);
-  const int N = 8;
-  long rA[N], rB[N];
-  for (int i = 0; i < N; i++) { rA[i] = touchReadRaw(0x90); rB[i] = touchReadRaw(0xD0); }
-  digitalWrite(TOUCH_CS, HIGH);
-  vspi.endTransaction();
-  if (digitalRead(TOUCH_IRQ) == HIGH) return false;
-  for (int i=1;i<N;i++){
-    for(int j=i;j>0&&rA[j]<rA[j-1];j--){long t=rA[j];rA[j]=rA[j-1];rA[j-1]=t;}
-    for(int j=i;j>0&&rB[j]<rB[j-1];j--){long t=rB[j];rB[j]=rB[j-1];rB[j-1]=t;}
-  }
-  long sA=0,sB=0;
-  for(int i=2;i<N-2;i++){sA+=rA[i];sB+=rB[i];}
-  uint16_t xR=sA/(N-4), yR=sB/(N-4);
-  if(xR<200||xR>3900||yR<200||yR>3900) return false;
-  tx = constrain(map(xR,300,3750,0,SCREEN_W),0,SCREEN_W-1);
-  ty = constrain(map(yR,300,3750,0,SCREEN_H),0,SCREEN_H-1);
+  if (!ts.touched()) return false;
+  TS_Point p = ts.getPoint();
+  if (p.x == 0 && p.y == 0) return false;
+  tx = constrain(map(p.y, 0, 320, 0, SCREEN_W), 0, SCREEN_W - 1);
+  ty = constrain(map(p.x, 0, 240, SCREEN_H, 0), 0, SCREEN_H - 1);
   return true;
 }
 
@@ -791,53 +784,68 @@ void updateStatusBar() {
 // ═══════════════════════════════════════════════════════════
 
 void updateFooter() {
-  tft.fillRect(0, FOOT_Y, SCREEN_W, FOOT_H, 0x0841);
-  tft.drawFastHLine(0, FOOT_Y, SCREEN_W, CLR_DARKGRAY);
-
+  char timeStr[9];
   char buf[48];
+  getTimeStr(timeStr);
 
-  // ── Hora ─────────────────────────────────────────────────
-  getTimeStr(buf);
-  tft.setTextSize(1);
-  tft.setTextColor(ntpSynced ? CLR_WHITE : CLR_GRAY);
-  tft.setCursor(6, FOOT_Y+5);
-  tft.print(buf);
-
-  // ── Local ────────────────────────────────────────────────
-  tft.drawFastVLine(74, FOOT_Y+2, 13, CLR_DARKGRAY);
-  tft.setTextColor(wifiConnected ? CLR_GRAY : CLR_DARKGRAY);
-  tft.setCursor(80, FOOT_Y+5);
-  tft.print(wifiConnected ? LOCATION_NAME : "WiFi: OFF");
-
-  // ── Temperatura externa ──────────────────────────────────
-  tft.drawFastVLine(178, FOOT_Y+2, 13, CLR_DARKGRAY);
-  tft.setCursor(184, FOOT_Y+5);
-  if (!isnan(extTemp)) {
-    snprintf(buf, sizeof(buf), "Ext:%.1fC", extTemp);
-    tft.setTextColor(CLR_CYAN);
-  } else {
-    snprintf(buf, sizeof(buf), "Ext: --.-C");
-    tft.setTextColor(CLR_DARKGRAY);
-  }
-  tft.print(buf);
-
-  // Linha 2: uso acumulado
-  tft.drawFastHLine(0, FOOT_Y+17, SCREEN_W, 0x1082);
   uint32_t sessionMin = (activeMode != MODE_NONE && modeStartMs > 0)
                         ? (uint32_t)((millis()-modeStartMs)/60000UL) : 0;
   uint32_t today = nvsDayMin + sessionMin;
   uint32_t total = nvsTotalMin + sessionMin;
 
-  snprintf(buf,sizeof(buf),"24h: %uh %02um", today/60, today%60);
-  tft.setTextColor(CLR_GOLD);
-  tft.setCursor(6, FOOT_Y+21); tft.print(buf);
+  bool timeChanged  = (strcmp(timeStr, ftrTime) != 0);
+  bool wifiChanged  = (wifiConnected != ftrWifi);
+  bool extChanged   = (isnan(extTemp) != isnan(ftrExtTemp)) ||
+                      (!isnan(extTemp) && fabsf(extTemp - ftrExtTemp) >= 0.1f);
+  bool usageChanged = (today != ftrToday || total != ftrTotal);
+  bool fullRedraw   = footerDirty || wifiChanged || extChanged || usageChanged;
 
-  tft.drawFastVLine(168, FOOT_Y+18, 11, CLR_DARKGRAY);
-  snprintf(buf,sizeof(buf),"30d: %uh", total/60);
-  tft.setCursor(174, FOOT_Y+21); tft.print(buf);
+  if (!timeChanged && !fullRedraw) return;
 
-  tft.setTextColor(0x2945);
-  tft.setCursor(244, FOOT_Y+21); tft.print("(aprox)");
+  tft.setTextSize(1);
+
+  if (fullRedraw) {
+    footerDirty = false;
+    tft.fillRect(0, FOOT_Y, SCREEN_W, FOOT_H, 0x0841);
+    tft.drawFastHLine(0, FOOT_Y, SCREEN_W, CLR_DARKGRAY);
+    tft.drawFastVLine(74,  FOOT_Y+2, 13, CLR_DARKGRAY);
+    tft.drawFastVLine(178, FOOT_Y+2, 13, CLR_DARKGRAY);
+    tft.drawFastHLine(0, FOOT_Y+17, SCREEN_W, 0x1082);
+    tft.drawFastVLine(168, FOOT_Y+18, 11, CLR_DARKGRAY);
+
+    tft.setTextColor(wifiConnected ? CLR_GRAY : CLR_DARKGRAY);
+    tft.setCursor(80, FOOT_Y+5);
+    tft.print(wifiConnected ? LOCATION_NAME : "WiFi: OFF");
+
+    tft.setCursor(184, FOOT_Y+5);
+    if (!isnan(extTemp)) {
+      snprintf(buf, sizeof(buf), "Ext:%.1fC", extTemp);
+      tft.setTextColor(CLR_CYAN);
+    } else {
+      snprintf(buf, sizeof(buf), "Ext: --.-C");
+      tft.setTextColor(CLR_DARKGRAY);
+    }
+    tft.print(buf);
+
+    snprintf(buf, sizeof(buf), "24h: %uh %02um", today/60, today%60);
+    tft.setTextColor(CLR_GOLD);
+    tft.setCursor(6, FOOT_Y+21); tft.print(buf);
+    snprintf(buf, sizeof(buf), "30d: %uh", total/60);
+    tft.setCursor(174, FOOT_Y+21); tft.print(buf);
+    tft.setTextColor(0x2945);
+    tft.setCursor(244, FOOT_Y+21); tft.print("(aprox)");
+
+    ftrWifi    = wifiConnected;
+    ftrExtTemp = extTemp;
+    ftrToday   = today;
+    ftrTotal   = total;
+  }
+
+  // Hora: sobrescreve no lugar com cor de fundo — sem fillRect, sem flash
+  strcpy(ftrTime, timeStr);
+  tft.setTextColor(ntpSynced ? CLR_WHITE : CLR_GRAY, 0x0841);
+  tft.setCursor(6, FOOT_Y+5);
+  tft.print(timeStr);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -866,6 +874,7 @@ void drawScreen() {
   dspTemp = -999.0f; dspHum = -999.0f; dspDryTemp = -1.0f;
   dspHeater = !heaterOn; dspCooler = !coolerOn;
   dspState = (CtrlState)99; dspMode = (OpMode)99;
+  footerDirty = true;
 
   updateSensors();
   updateStatusBar();
@@ -1062,17 +1071,19 @@ void setup() {
   pinMode(COOLER_PIN, OUTPUT); digitalWrite(COOLER_PIN, RELAY_OFF);
 
   // Display
-  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
-  hspi.begin(TFT_CLK, TFT_MISO, TFT_MOSI, TFT_CS);
-  tft.init(240, 320);
-  tft.invertDisplay(true);
-  tft.setRotation(3);
+  pinMode(TFT_BL, OUTPUT); analogWrite(TFT_BL, 255);
+  tftSPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tft.begin(40000000);
+  tft.setRotation(1);
   tft.fillScreen(CLR_BG);
 
-  // Touch
-  vspi.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-  pinMode(TOUCH_CS, OUTPUT); digitalWrite(TOUCH_CS, HIGH);
-  pinMode(TOUCH_IRQ, INPUT);
+  // Touch I2C
+  Wire.begin(TOUCH_SDA, TOUCH_SCL);
+  pinMode(TOUCH_RST, OUTPUT);
+  digitalWrite(TOUCH_RST, LOW);  delay(10);
+  digitalWrite(TOUCH_RST, HIGH); delay(100);
+  pinMode(TOUCH_INT, INPUT_PULLUP);
+  ts.begin(40);
 
   // Sensor
   dht.begin();
@@ -1101,7 +1112,7 @@ void loop() {
   updateCoolerTail();   // gerencia o tail de 5 min do cooler após cada desligamento do aquecedor
 
   if (now - lastSensDisp >= 500)  { lastSensDisp = now; updateSensors(); }
-  if (now - lastStatDisp >= 250)  { lastStatDisp = now; updateStatusBar(); }
+  if (now - lastStatDisp >= 1000) { lastStatDisp = now; updateStatusBar(); }
   if (now - lastFootDisp >= 1000) { lastFootDisp = now; updateFooter(); }
 
   // WiFi: verifica reconexão a cada 60 s (não bloqueante)
