@@ -29,6 +29,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 
 // ─── Display SPI ─────────────────────────────────────────────
@@ -109,6 +110,10 @@
                           "&current_weather=true"
 #define WEATHER_INTERVAL  (10UL * 60UL * 1000UL)   // a cada 10 min
 #define LOCATION_NAME     "Curitiba/PR"
+
+// ─── OTA ─────────────────────────────────────────────────────
+#define OTA_HOSTNAME      "estufa-fikra"
+#define OTA_PASSWORD      "fikra2024"
 
 // ─── Layout ──────────────────────────────────────────────────
 #define HDR_H      22
@@ -1132,6 +1137,67 @@ void getTimeStr(char* buf) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  OTA
+// ═══════════════════════════════════════════════════════════
+
+void drawOTAScreen(int pct) {
+  static bool drawn = false;
+  if (!drawn) {
+    tft.fillScreen(CLR_BG);
+    tft.setTextColor(CLR_GOLD); tft.setTextSize(3);
+    tft.setCursor(32, 60); tft.print("Atualizando");
+    tft.setTextColor(CLR_GRAY); tft.setTextSize(1);
+    tft.setCursor(80, 100); tft.print("Nao desligue!");
+    tft.drawRoundRect(10, 130, SCREEN_W - 20, 24, 4, CLR_DARKGRAY);
+    drawn = true;
+  }
+  int barW = (SCREEN_W - 24) * pct / 100;
+  tft.fillRoundRect(12, 132, barW, 20, 3, CLR_GREEN);
+  char buf[8]; snprintf(buf, sizeof(buf), "%d%%", pct);
+  tft.fillRect(140, 162, 40, 10, CLR_BG);
+  tft.setTextColor(CLR_WHITE); tft.setTextSize(1);
+  tft.setCursor(148, 162); tft.print(buf);
+}
+
+void setupOTA() {
+  if (!wifiConnected) return;
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    // Garante relés OFF durante atualização
+    digitalWrite(HEATER_PIN, RELAY_OFF);
+    digitalWrite(COOLER_PIN, RELAY_OFF);
+    drawOTAScreen(0);
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    drawOTAScreen(progress * 100 / total);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    tft.fillScreen(CLR_BG);
+    tft.setTextColor(CLR_GREEN); tft.setTextSize(2);
+    tft.setCursor(50, 110); tft.print("Atualizado!");
+    tft.setTextColor(CLR_GRAY); tft.setTextSize(1);
+    tft.setCursor(90, 140); tft.print("Reiniciando...");
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    tft.fillScreen(CLR_BG);
+    tft.setTextColor(CLR_RED); tft.setTextSize(2);
+    tft.setCursor(60, 100); tft.print("Erro OTA!");
+    tft.setTextColor(CLR_GRAY); tft.setTextSize(1);
+    tft.setCursor(70, 130); tft.print("Tente novamente");
+    delay(3000);
+    drawScreen();
+  });
+
+  ArduinoOTA.begin();
+}
+
+// ═══════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════
 
@@ -1169,6 +1235,7 @@ void setup() {
   // WiFi + NTP + primeira leitura de clima
   connectWiFi();      // bloqueia até 12 s com feedback no footer
   fetchWeather();     // busca temperatura externa imediatamente após conectar
+  setupOTA();         // inicia OTA (só se WiFi conectou)
   drawScreen();       // redesenha com dados reais (hora, local, temp ext)
 }
 
@@ -1179,6 +1246,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  ArduinoOTA.handle();
   readSensor();
   checkSensorRecovery();
   updateControl();
