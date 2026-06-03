@@ -48,7 +48,7 @@
 #define TOUCH_RST  18
 
 // ─── Periféricos ─────────────────────────────────────────────
-#define DHT22_PIN   2
+#define DHT22_PIN  21
 #define HEATER_PIN  3
 #define COOLER_PIN 14
 #define RELAY_ON   LOW
