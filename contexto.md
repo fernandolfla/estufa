@@ -69,23 +69,40 @@
 
 ## Estado Atual do Firmware (`estufa.ino`)
 
-**Versão:** 1.2 — Portado para ESP32-S3 + ILI9341 + FT6336G
+**Versão:** 1.3 — Cooler tail à prova de falhas + segurança de reinício
+
+### Regra imutável do cooler (implementada v1.3)
+
+```
+coolerOn = heaterOn || coolerTailActive
+```
+
+O cooler **nunca** é controlado diretamente pela lógica de modo. Apenas `setHeater()` e `updateCoolerTail()` alteram o cooler via `applyCooler()`. Qualquer chamada `setCooler()` foi removida de `updateControl()`.
+
+Isso garante que em **todos os cenários** — troca de modo, desativação, ciclagem de temperatura, reinicialização — o cooler sempre roda 5 minutos após o aquecedor desligar.
 
 ### Lógica de controle
 
 **MODO ESTUFA (controle por umidade):**
 - State machine: `ST_IDLE` → `ST_DRYING` (umid ≥ 40%) → `ST_COOLING` (umid ≤ 32%) → `ST_IDLE`
 - Histerese de umidade: 40% para ligar, 32% para desligar (8% de margem)
-- Cooler tail: cooler fica ON por 5 min após o aquecedor desligar
 - Segurança de temperatura: aquecedor OFF em ≥ 50°C, re-habilita em ≤ 47°C
 
 **MODO SECAGEM (aquecimento contínuo até temperatura alvo):**
 - Temperatura alvo ajustável 45–55°C (padrão 45°C, salvo em NVS)
 - Histerese: OFF em ≥ alvo, re-habilita em ≤ alvo-3°C
-- Cooler acompanha o aquecedor (ON/OFF juntos)
 - Botões +/− dentro do botão SECAGEM para ajuste fino
 
-**Ambos os modos:**
+**Ambos os modos — cooler tail:**
+- Aquecedor liga → cooler liga junto (`applyCooler()`)
+- Aquecedor desliga → `coolerTailActive = true`, cooler fica ON por 5 min
+- Tail expira → `applyCooler()` desliga cooler (somente se aquecedor também off)
+- Troca de modo (ex.: SECAGEM→ESTUFA): tail preservado automaticamente
+- `heaterWas` salvo no NVS a cada transição do aquecedor
+- **Reinício com aquecedor ligado:** `loadNVS()` detecta `heaterWas=true` e inicia tail de 5 min imediatamente no boot, antes de qualquer outra coisa
+- Emergência (sensor falhou): shutdown imediato SEM tail, `heaterWas=false` gravado
+
+**Ambos os modos — outros:**
 - Emergência: 5 falhas consecutivas do sensor → `ST_EMERGENCY`, tudo OFF
 - Relés inicializam OFF antes de qualquer outra lógica
 - `dryTemp` persiste em NVS entre sessões

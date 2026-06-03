@@ -359,6 +359,57 @@ Emergência: só reset por power cycle. Mostra aviso vermelho na tela.
 
 ---
 
+## Skill 12 — Cooler Tail: Regra Imutável do Cooler
+
+**Contexto:** O cooler é um dissipador de calor do aquecedor. Desligá-lo junto com o aquecedor deixa calor residual perigoso no elemento. Esta skill descreve o padrão implementado e que **nunca deve ser revertido**.
+
+**Regra:**
+```
+coolerOn = heaterOn || coolerTailActive
+```
+
+**Implementação aprovada (não alterar):**
+```cpp
+// Única função que toca o GPIO do cooler
+void applyCooler() {
+  bool desired = heaterOn || coolerTailActive;
+  if (coolerOn == desired) return;
+  coolerOn = desired;
+  digitalWrite(COOLER_PIN, desired ? RELAY_ON : RELAY_OFF);
+}
+
+// Ao desligar o aquecedor, inicia o tail de 5 min automaticamente
+void setHeater(bool on) {
+  if (heaterOn == on) return;
+  bool wasOn = heaterOn;
+  heaterOn = on;
+  digitalWrite(HEATER_PIN, on ? RELAY_ON : RELAY_OFF);
+  saveHeaterState(on);          // persiste no NVS para sobreviver a reboot
+  if (wasOn && !on) {
+    coolerTailActive = true;
+    coolerTailEnd    = millis() + COOLER_TAIL_MS;
+  }
+  applyCooler();
+}
+
+// Expira o tail — chamado no loop()
+void updateCoolerTail() {
+  if (!coolerTailActive || millis() < coolerTailEnd) return;
+  coolerTailActive = false;
+  applyCooler();
+}
+```
+
+**O que NÃO fazer:**
+- Nunca chamar `setCooler()` ou `digitalWrite(COOLER_PIN, ...)` fora de `applyCooler()` e `emergencyShutdown()`
+- Nunca chamar `setCooler(false)` diretamente em `updateControl()` — isso bypassaria o tail
+
+**Segurança de reinício:** `saveHeaterState(true/false)` salva no NVS a cada transição. Em `loadNVS()`, se `heaterWas = true`, o tail é iniciado imediatamente antes da tela aparecer.
+
+**Por que isso importa:** O padrão anterior usava `setCooler(on)` dentro de `updateControl()`. Quando o tail expirava, `coolerTailActive` voltava a `false` e a próxima chamada `setCooler(false)` desligava o cooler imediatamente — exatamente o bug que esta skill resolve.
+
+---
+
 ## Regras Gerais de Qualidade
 
 1. **Sem `delay()` no loop principal** — usar `millis()` para tudo
