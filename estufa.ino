@@ -214,68 +214,68 @@ unsigned long lastTouchTime = 0;
 bool          lastTouchDown = false;
 
 // ═══════════════════════════════════════════════════════════
-//  RELÉS
+//  RELÉS — REGRA ÚNICA E IMUTÁVEL:
+//    coolerOn = heaterOn || coolerTailActive
+//  O cooler NUNCA é controlado diretamente pela lógica de modo.
+//  Apenas setHeater() e updateCoolerTail() alteram o estado do cooler.
 // ═══════════════════════════════════════════════════════════
 
-// Quando o aquecedor DESLIGA: dispara automaticamente o tail de 5 min no cooler.
+// Grava imediatamente no NVS se o aquecedor estava ligado.
+// Usado para iniciar o tail automaticamente após um reinício inesperado.
+void saveHeaterState(bool on) {
+  Preferences p;
+  p.begin("estufa", false);
+  p.putBool("heaterWas", on);
+  p.end();
+}
+
+// Deriva e aplica o estado físico do cooler a partir do estado do aquecedor e do tail.
+// É a ÚNICA função que toca o GPIO do cooler (exceto emergencyShutdown).
+void applyCooler() {
+  bool desired = heaterOn || coolerTailActive;
+  if (coolerOn == desired) return;
+  coolerOn = desired;
+  digitalWrite(COOLER_PIN, desired ? RELAY_ON : RELAY_OFF);
+}
+
+// Controla o aquecedor. Ao desligar, inicia automaticamente o tail de 5 min no cooler.
 void setHeater(bool on) {
   if (heaterOn == on) return;
   bool wasOn = heaterOn;
-  heaterOn = on;
+  heaterOn   = on;
   digitalWrite(HEATER_PIN, on ? RELAY_ON : RELAY_OFF);
+  saveHeaterState(on);
 
   if (wasOn && !on) {
-    // Aquecedor acabou de desligar — garante cooler por mais 5 min
+    // Aquecedor desligou — inicia (ou reinicia) o tail do cooler
     coolerTailActive = true;
     coolerTailEnd    = millis() + COOLER_TAIL_MS;
-    if (!coolerOn) {                            // garante que cooler está fisicamente ON
-      coolerOn = true;
-      digitalWrite(COOLER_PIN, RELAY_ON);
-    }
   }
+  applyCooler();
 }
 
-// O tail prevalece: nunca desliga o cooler enquanto o tail estiver ativo.
-void setCooler(bool on) {
-  bool actual = (on || coolerTailActive);
-  if (coolerOn == actual) return;
-  coolerOn = actual;
-  digitalWrite(COOLER_PIN, actual ? RELAY_ON : RELAY_OFF);
-}
-
-// Verifica o vencimento do tail e desliga o cooler se tudo mais também estiver off.
-// "modeNeedsCooler": true enquanto o ciclo ativo ainda precisa do cooler (ex.: ST_DRYING
-// com temp.safety — não queremos desligar o cooler enquanto estamos apenas esperando o
-// aquecedor voltar).
+// Verifica o vencimento do tail. Quando expira, re-avalia o cooler via applyCooler().
 void updateCoolerTail() {
   if (!coolerTailActive) return;
   if (millis() < coolerTailEnd) return;
-
   coolerTailActive = false;
-  bool modeNeedsCooler = (ctrlState == ST_DRYING || ctrlState == ST_COOLING);
-  if (!heaterOn && !modeNeedsCooler) {
-    coolerOn = false;
-    digitalWrite(COOLER_PIN, RELAY_OFF);
-  }
+  applyCooler();  // desliga cooler se heater também estiver off
 }
 
-// Desativa o sistema. O cooler respeita o tail se o aquecedor estava ligado.
-// Para emergência (sensor falhou), use emergencyShutdown() que ignora o tail.
+// Desativa o sistema de forma segura, respeitando o tail do cooler.
 void shutdownAll() {
   estufaHeaterWanted = false;
   estufaTempSafety   = false;
   dryTempSafety      = false;
-  setHeater(false);                  // dispara o tail se estava ligado
-  if (!coolerTailActive) {
-    setCooler(false);                // sem tail: desliga imediatamente
-  }
+  setHeater(false);   // dispara o tail se estava ligado; applyCooler() cuida do cooler
 }
 
-// Emergência: desliga TUDO imediatamente, cancela o tail.
+// Emergência real (sensor falhou): desliga TUDO imediatamente, cancela o tail.
 void emergencyShutdown() {
   coolerTailActive = false;
   heaterOn = false; digitalWrite(HEATER_PIN, RELAY_OFF);
   coolerOn = false; digitalWrite(COOLER_PIN, RELAY_OFF);
+  saveHeaterState(false);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -325,9 +325,8 @@ void updateControl() {
     }
 
     bool h = estufaHeaterWanted && !estufaTempSafety && (ctrlState == ST_DRYING);
-    bool c = (ctrlState == ST_DRYING) || (ctrlState == ST_COOLING);
     setHeater(h);
-    setCooler(c);
+    // Cooler gerenciado exclusivamente por setHeater()/updateCoolerTail() via applyCooler()
   }
 
   // ──────────────────────────────────────────────────────────
@@ -349,8 +348,8 @@ void updateControl() {
 
     bool on = !dryTempSafety;
     setHeater(on);
-    setCooler(on);   // cooler acompanha aquecedor no modo secagem
-    ctrlState = ST_DRYING;  // estado "em operação" para a status bar
+    // Cooler gerenciado exclusivamente por setHeater()/updateCoolerTail() via applyCooler()
+    ctrlState = ST_DRYING;
   }
 }
 
@@ -398,13 +397,26 @@ uint32_t currentDayIdx() {
 
 void loadNVS() {
   prefs.begin("estufa", true);
-  nvsTotalMin = prefs.getUInt("totalMin", 0);
-  nvsDayMin   = prefs.getUInt("dayMin",   0);
-  nvsLastDay  = prefs.getUInt("lastDay",  0);
-  dryTemp     = prefs.getFloat("dryTemp", SECAR_TEMP_DEF);
+  nvsTotalMin        = prefs.getUInt("totalMin",  0);
+  nvsDayMin          = prefs.getUInt("dayMin",    0);
+  nvsLastDay         = prefs.getUInt("lastDay",   0);
+  dryTemp            = prefs.getFloat("dryTemp",  SECAR_TEMP_DEF);
+  bool heaterWasOn   = prefs.getBool("heaterWas", false);
   prefs.end();
+
   dryTemp = constrain(dryTemp, SECAR_TEMP_MIN, SECAR_TEMP_MAX);
   if (currentDayIdx() != nvsLastDay) { nvsDayMin = 0; nvsLastDay = currentDayIdx(); }
+
+  // Segurança de reinício: se o aquecedor estava ligado quando o dispositivo foi
+  // reiniciado (queda de energia, crash), liga o cooler por 5 min para dissipar calor residual.
+  if (heaterWasOn) {
+    coolerTailActive = true;
+    coolerTailEnd    = millis() + COOLER_TAIL_MS;
+    coolerOn         = true;
+    digitalWrite(COOLER_PIN, RELAY_ON);
+    // Limpa o flag — o tail foi iniciado, não precisamos repetir no próximo boot
+    saveHeaterState(false);
+  }
 }
 
 void saveNVS(bool force = false) {
