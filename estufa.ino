@@ -932,7 +932,7 @@ void updateFooter() {
 void drawScreen() {
   tft.fillScreen(CLR_BG);
   tft.setTextColor(CLR_GRAY); tft.setTextSize(1);
-  const char* hdr = "Escolha o modo de operacao";
+  const char* hdr = "Modo de operacao";
   tft.setCursor((SCREEN_W - (int)strlen(hdr)*6)/2, 7);
   tft.print(hdr);
   tft.drawFastHLine(0, HDR_H, SCREEN_W, CLR_DARKGRAY);
@@ -996,28 +996,17 @@ void handleTouch() {
     tapped = MODE_SECAGEM;
 
   if (tapped == MODE_NONE) return;
+  if (activeMode == tapped) return;   // já está neste modo — nada a fazer
 
-  if (activeMode == tapped) {
-    // Toggle: desativa
-    saveNVS(true);
-    activeMode = MODE_NONE;
-    modeStartMs = 0;
-    ctrlState = ST_IDLE;
-    estufaHeaterWanted = false;
-    estufaTempSafety   = false;
-    dryTempSafety      = false;
-    shutdownAll();
-  } else {
-    // Ativa novo modo
-    if (activeMode != MODE_NONE) saveNVS(true);
-    activeMode  = tapped;
-    modeStartMs = millis();
-    lastSaveMs  = millis();
-    ctrlState   = ST_IDLE;
-    estufaHeaterWanted = false;
-    estufaTempSafety   = false;
-    dryTempSafety      = false;
-  }
+  // Troca de modo (sempre há um modo ativo)
+  saveNVS(true);
+  activeMode  = tapped;
+  modeStartMs = millis();
+  lastSaveMs  = millis();
+  ctrlState   = ST_IDLE;
+  estufaHeaterWanted = false;
+  estufaTempSafety   = false;
+  dryTempSafety      = false;
 
   drawModeBtn(MODE_ESTUFA);
   drawModeBtn(MODE_SECAGEM);
@@ -1228,6 +1217,12 @@ void setup() {
 
   // NVS (carrega dryTemp salvo e contadores de uso)
   loadNVS();
+
+  // Sempre inicia no modo SECAGEM
+  activeMode  = MODE_SECAGEM;
+  modeStartMs = millis();
+  lastSaveMs  = millis();
+  ctrlState   = ST_IDLE;
 
   // Tela inicial (antes do WiFi para resposta imediata)
   drawScreen();
