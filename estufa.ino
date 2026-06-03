@@ -85,9 +85,11 @@
 #define SECAR_HISTERESE    3.0f   // OFF em >= alvo, ON em <= alvo-3
 
 // ─── Timing ──────────────────────────────────────────────────
-#define SENSOR_INTERVAL   3000UL
-#define SENSOR_FAIL_MAX   5
-#define NVS_SAVE_INTERVAL 30000UL
+#define SENSOR_INTERVAL        3000UL
+#define SENSOR_FAIL_MAX        5
+#define SENSOR_RECOVERY_DELAY  10000UL  // espera 10s em emergency antes de tentar
+#define SENSOR_RECOVERY_MAX    3        // tentativas soft antes do ESP.restart()
+#define NVS_SAVE_INTERVAL      30000UL
 #define TEMP_WARN         45.0f   // aviso visual de temperatura
 
 // ─── WiFi ────────────────────────────────────────────────────
@@ -175,7 +177,9 @@ unsigned long lastSensDisp   = 0;
 unsigned long lastStatDisp   = 0;
 unsigned long lastFootDisp   = 0;
 unsigned long lastNVSSave    = 0;
-int           sensorFails    = 0;
+int           sensorFails       = 0;
+unsigned long emergencyStartMs  = 0;
+int           recoveryAttempts  = 0;
 
 // ─── WiFi / NTP / Clima ──────────────────────────────────────
 bool          wifiConnected   = false;
@@ -366,14 +370,22 @@ void readSensor() {
 
   if (isnan(t) || isnan(h)) {
     sensorFails++;
-    if (sensorFails >= SENSOR_FAIL_MAX) {
+    if (sensorFails >= SENSOR_FAIL_MAX && ctrlState != ST_EMERGENCY) {
       ctrlState = ST_EMERGENCY;
-      emergencyShutdown();   // desliga tudo imediatamente, sem tail
+      emergencyShutdown();
+      emergencyStartMs = millis();
     }
     return;
   }
 
-  sensorFails = 0;
+  // Leitura bem-sucedida — zera contadores e cancela emergency se estava ativo
+  sensorFails      = 0;
+  recoveryAttempts = 0;
+  if (ctrlState == ST_EMERGENCY) {
+    ctrlState      = ST_IDLE;
+    emergencyStartMs = 0;
+    drawScreen();
+  }
   curTemp = t;
   curHum  = h;
 }
@@ -381,6 +393,45 @@ void readSensor() {
 // ═══════════════════════════════════════════════════════════
 //  NVS
 // ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  RECUPERAÇÃO DE SENSOR
+// ═══════════════════════════════════════════════════════════
+
+void checkSensorRecovery() {
+  if (ctrlState != ST_EMERGENCY) return;
+  if (millis() - emergencyStartMs < SENSOR_RECOVERY_DELAY) return;
+
+  recoveryAttempts++;
+
+  if (recoveryAttempts > SENSOR_RECOVERY_MAX) {
+    // Esgotou tentativas soft — reinicia o dispositivo inteiro
+    tft.fillRect(0, STAT_Y, SCREEN_W, FOOT_H + STAT_H, CLR_BG);
+    tft.setTextColor(CLR_RED); tft.setTextSize(1);
+    tft.setCursor(20, STAT_Y + 6);
+    tft.print("Sensor irrecuperavel. Reiniciando...");
+    delay(3000);
+    ESP.restart();
+    return;
+  }
+
+  // Tentativa soft: reinicializa a biblioteca e aguarda sensor estabilizar
+  tft.fillRect(0, STAT_Y, SCREEN_W, STAT_H, CLR_BG);
+  tft.setTextColor(CLR_YELLOW); tft.setTextSize(1);
+  tft.setCursor(20, STAT_Y + 6);
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Recuperando sensor... tentativa %d/%d",
+           recoveryAttempts, SENSOR_RECOVERY_MAX);
+  tft.print(buf);
+
+  dht.begin();
+  delay(2000);  // DHT22 precisa de ~2s para estabilizar após reinit
+
+  sensorFails      = 0;
+  ctrlState        = ST_IDLE;
+  emergencyStartMs = millis();  // reseta timer — se falhar de novo entra no próximo ciclo
+  drawScreen();
+}
 
 uint32_t currentDayIdx() {
   if (ntpSynced) {
@@ -757,7 +808,16 @@ void updateStatusBar() {
   tft.setCursor(66, STAT_Y + 6);
   if (ctrlState == ST_EMERGENCY) {
     tft.setTextColor(CLR_RED);
-    tft.print("!! EMERGENCIA: sensor falhou !!");
+    unsigned long elapsed = millis() - emergencyStartMs;
+    if (elapsed < SENSOR_RECOVERY_DELAY) {
+      char buf[48];
+      unsigned long remSec = (SENSOR_RECOVERY_DELAY - elapsed) / 1000UL + 1;
+      snprintf(buf, sizeof(buf), "Sensor falhou! Recuperando em %lus (%d/%d)",
+               remSec, recoveryAttempts + 1, SENSOR_RECOVERY_MAX);
+      tft.print(buf);
+    } else {
+      tft.print("!! EMERGENCIA: sensor falhou !!");
+    }
   } else if (activeMode == MODE_SECAGEM) {
     char buf[40];
     if (heaterOn) {
@@ -1120,6 +1180,7 @@ void loop() {
   unsigned long now = millis();
 
   readSensor();
+  checkSensorRecovery();
   updateControl();
   updateCoolerTail();   // gerencia o tail de 5 min do cooler após cada desligamento do aquecedor
 
