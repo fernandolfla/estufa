@@ -1218,8 +1218,8 @@ void setup() {
   // NVS (carrega dryTemp salvo e contadores de uso)
   loadNVS();
 
-  // Sempre inicia no modo SECAGEM
-  activeMode  = MODE_SECAGEM;
+  // Sempre inicia no modo ESTUFA
+  activeMode  = MODE_ESTUFA;
   modeStartMs = millis();
   lastSaveMs  = millis();
   ctrlState   = ST_IDLE;
