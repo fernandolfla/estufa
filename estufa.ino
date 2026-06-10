@@ -1,20 +1,46 @@
 /*
  * ============================================================
- *  ESTUFA DE FILAMENTOS — Firmware v1.1
- *  Board  : ESP32 CYD 2432S028 | Driver: ST7789
- *  Sensor : DHT22        — GPIO 4
- *  Relé 1 : Aquecedor    — GPIO 26  (ativo LOW)
- *  Relé 2 : Cooler/Fan   — GPIO 27  (ativo LOW)
+ *  ESTUFA DE FILAMENTOS — Firmware v1.3
+ *
+ *  Board   : LCDWIKI ES3C28P / ES3N28P (ESP32-S3)
+ *  Display : ILI9341 2.8" 320×240 SPI  | Touch: FT6336G I2C
+ *  Sensor  : DHT22              — GPIO 21
+ *  Relé 1  : Aquecedor          — GPIO  3  (ativo LOW)
+ *  Relé 2  : Cooler/Fan         — GPIO 14  (ativo LOW)
+ *
+ *  IDE     : Arduino IDE  |  Board setting: ESP32S3 Dev Module
+ *  Partition: Huge APP (3MB No OTA)  |  USB: Hardware CDC and JTAG
  * ============================================================
- *  MODO ESTUFA  — controle por umidade:
- *    >= 40 % → liga AQUECEDOR + COOLER
- *    <= 32 % → desliga AQUECEDOR, COOLER por 5 min
- *    Temperatura: nunca excede 50 °C (histerese 47/50)
+ *
+ *  REGRA IMUTÁVEL DO COOLER:
+ *    coolerOn = heaterOn || coolerTailActive
+ *    O cooler NUNCA é controlado diretamente pela lógica de modo.
+ *    Somente setHeater() e updateCoolerTail() tocam o GPIO do cooler,
+ *    sempre via applyCooler(). Qualquer desvio desta regra é um bug.
+ *
+ *  MODO ESTUFA — controle por umidade:
+ *    ST_IDLE   → umid >= 40 %  → ST_DRYING  (liga aquecedor + cooler)
+ *    ST_DRYING → umid <= 32 %  → ST_COOLING (desliga aquecedor; cooler tail 5 min)
+ *    ST_COOLING → tail expirou → ST_IDLE
+ *    Segurança: aquecedor bloqueado em >= 50 °C, reabilita em <= 47 °C
  *
  *  MODO SECAGEM — aquecimento contínuo até temperatura alvo:
- *    Alvo ajustável 45–55 °C (default 45 °C, botões +/− no display)
- *    Histerese de 3 °C: OFF em >= alvo, ON em <= alvo-3
- *    COOLER acompanha o AQUECEDOR
+ *    Alvo ajustável 45–55 °C (padrão 45 °C, salvo em NVS, botões +/− no display)
+ *    Histerese: OFF em >= alvo, religa em <= alvo − 3 °C
+ *
+ *  COOLER TAIL (ambos os modos):
+ *    Aquecedor desliga → cooler permanece ON por 5 min para dissipar calor residual.
+ *    Reinício com aquecedor ligado: loadNVS() detecta heaterWas=true e inicia o
+ *    tail imediatamente no boot, antes de qualquer outra lógica.
+ *    Emergência (sensor falhou 5×): shutdown imediato SEM tail.
+ *
+ *  PERSISTÊNCIA (NVS):
+ *    dryTemp, contadores de uso 24h/30d, heaterWas (segurança de reinício).
+ *    Gravação automática a cada 30 s e em toda troca de modo.
+ *
+ *  CONECTIVIDADE:
+ *    WiFi → NTP (UTC-3) + Open-Meteo (temp. externa, sem API key) + ArduinoOTA.
+ *    Hostname OTA: "estufa-fikra".
  * ============================================================
  */
 
